@@ -1,0 +1,20 @@
+services:
+  - type: worker
+    name: early-pump-dump-scanner
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scanner.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        value: "5343991130"
+      - key: MIN_SCORE
+        value: "80"
+      - key: MAX_ALERTS_PER_HOUR
+        value: "5"
+      - key: COOLDOWN_MINUTES
+        value: "90"
+      - key: SCAN_SECONDS
+        value: "30"
