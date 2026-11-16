@@ -1,13 +1,19 @@
-name: Run scanner
+
+name: Run scanner V3
 
 on:
   workflow_dispatch:
   schedule:
     - cron: "*/5 * * * *"
 
+concurrency:
+  group: crypto-scanner-v3
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Checkout
@@ -21,13 +27,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run scanner
+      - name: Run scanner V3
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SCAN_SECONDS: "30"
-          MIN_SCORE: "80"
-          COOLDOWN_MIN: "90"
+          MIN_SCORE: "75"
           MAX_ALERTS_PER_HOUR: "5"
-          TOP_CANDIDATES: "20"
+          TOP_CANDIDATES: "30"
         run: python scanner.py
