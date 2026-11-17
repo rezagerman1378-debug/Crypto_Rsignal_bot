@@ -3,54 +3,72 @@ import os
 import time
 import statistics
 import requests
-from collections import defaultdict, deque
+from collections import deque
+
+# Early Pump + Dump Scanner V4
+# Conservative alerts only. No automatic trading.
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 MIN_SCORE = int(os.getenv("MIN_SCORE", "75"))
 MAX_ALERTS = int(os.getenv("MAX_ALERTS_PER_HOUR", "5"))
-TOP = int(os.getenv("TOP_CANDIDATES", "60"))
+TOP = int(os.getenv("TOP_CANDIDATES", "30"))
 
 BITUNIX = "https://fapi.bitunix.com"
 TOOBIT = "https://api.toobit.com"
 
 session = requests.Session()
-session.headers.update({"User-Agent": "EarlyScanner-V3"})
+session.headers.update({"User-Agent": "EarlyScanner-V4"})
 
 alert_history = deque()
 sent = set()
-errors = 0
+
+stats = {
+    "Bitunix": {"candidates": 0, "analyzed": 0, "errors": 0, "signals": 0},
+    "Toobit": {"candidates": 0, "analyzed": 0, "errors": 0, "signals": 0},
+}
+
+best_scores = {"PUMP": [], "DUMP": []}
 
 
 def get(url, params=None):
-    r = session.get(url, params=params, timeout=12)
-    r.raise_for_status()
-    data = r.json()
+    response = session.get(url, params=params, timeout=15)
+    response.raise_for_status()
+    data = response.json()
 
     if isinstance(data, dict):
-        if data.get("code") not in (None, 0, "0"):
+        code = data.get("code")
+        if code not in (None, 0, "0"):
             raise ValueError(str(data.get("msg", "API error")))
         return data.get("data", data)
 
     return data
 
 
-def send(message):
+def telegram_send(message):
     if not TOKEN or not CHAT_ID:
-        print(message)
-        return
+        print("TELEGRAM NOT CONFIGURED: token or chat_id is empty.")
+        return False
 
-    r = session.post(
+    response = session.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
         json={
             "chat_id": CHAT_ID,
             "text": message,
             "disable_web_page_preview": True
         },
-        timeout=12
+        timeout=15
     )
-    r.raise_for_status()
+
+    response.raise_for_status()
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError("Telegram API rejected message: " + str(result))
+
+    print("TELEGRAM SENT: message accepted by Telegram.")
+    return True
 
 
 def number(value, default=0):
@@ -66,21 +84,30 @@ def normalize_candles(raw):
     if isinstance(raw, dict):
         raw = raw.get("list", raw.get("rows", []))
 
-    for x in raw or []:
+    for candle in raw or []:
         try:
-            if isinstance(x, dict):
-                o = number(x.get("open"))
-                c = number(x.get("close"))
-                qv = number(x.get("quoteVol"))
-                if not qv:
-                    qv = number(x.get("baseVol")) * c
+            if isinstance(candle, dict):
+                opening = number(candle.get("open"))
+                closing = number(candle.get("close"))
+                quote_volume = number(candle.get("quoteVol"))
+
+                if not quote_volume:
+                    quote_volume = number(candle.get("baseVol")) * closing
             else:
-                o = number(x[1])
-                c = number(x[4])
-                qv = number(x[7] if len(x) > 7 else x[5])
-            if o > 0 and c > 0:
-                result.append({"open": o, "close": c, "volume": qv})
-        except Exception:
+                opening = number(candle[1])
+                closing = number(candle[4])
+                quote_volume = number(
+                    candle[7] if len(candle) > 7 else candle[5]
+                )
+
+            if opening > 0 and closing > 0:
+                result.append({
+                    "open": opening,
+                    "close": closing,
+                    "volume": quote_volume
+                })
+
+        except (IndexError, TypeError, KeyError):
             continue
 
     return result
@@ -88,35 +115,31 @@ def normalize_candles(raw):
 
 def volume_ratio(candles):
     if len(candles) < 8:
-        return 1
+        return 1.0
 
-    volumes = [x["volume"] for x in candles[-8:-1]]
-    current = candles[-1]["volume"]
-    avg = statistics.mean(volumes)
+    previous_volumes = [x["volume"] for x in candles[-8:-1]]
+    current_volume = candles[-1]["volume"]
+    average_volume = statistics.mean(previous_volumes)
 
-    return current / avg if avg > 0 else 1
+    return current_volume / average_volume if average_volume > 0 else 1.0
 
 
 def price_move(candles, periods=5):
     if len(candles) <= periods:
-        return 0
+        return 0.0
 
-    old = candles[-periods-1]["close"]
-    new = candles[-1]["close"]
+    old_price = candles[-periods - 1]["close"]
+    new_price = candles[-1]["close"]
 
-    return (new / old - 1) * 100 if old else 0
+    return (new_price / old_price - 1) * 100 if old_price else 0.0
 
 
 def book_imbalance(book):
     bids = book.get("bids", [])
     asks = book.get("asks", [])
 
-    bid_value = sum(
-        number(x[0]) * number(x[1]) for x in bids[:10]
-    )
-    ask_value = sum(
-        number(x[0]) * number(x[1]) for x in asks[:10]
-    )
+    bid_value = sum(number(x[0]) * number(x[1]) for x in bids[:10])
+    ask_value = sum(number(x[0]) * number(x[1]) for x in asks[:10])
 
     total = bid_value + ask_value
     return bid_value / total if total else 0.5
@@ -126,7 +149,6 @@ def evaluate(vr, move, imbalance, kind):
     score = 0
     reasons = []
 
-    # Unusual volume
     if vr >= 5:
         score += 28
         reasons.append("حجم معاملات بسیار غیرعادی")
@@ -139,7 +161,6 @@ def evaluate(vr, move, imbalance, kind):
     elif vr >= 1.5:
         score += 9
 
-    # Early price momentum
     if kind == "PUMP":
         if 0.15 <= move <= 1.5:
             score += 24
@@ -188,11 +209,25 @@ def evaluate(vr, move, imbalance, kind):
         score = min(score, 55)
 
     return max(0, min(100, score)), reasons
+def remember_best(exchange, symbol, kind, score, vr, move, imbalance):
+    item = {
+        "exchange": exchange,
+        "symbol": symbol,
+        "score": score,
+        "volume": vr,
+        "move": move,
+        "imbalance": imbalance
+    }
+
+    best_scores[kind].append(item)
+    best_scores[kind].sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+    del best_scores[kind][5:]
 
 
 def notify(exchange, symbol, kind, score, vr, move, imbalance, reasons):
-    global alert_history
-
     now = time.time()
 
     while alert_history and now - alert_history[0] > 3600:
@@ -200,20 +235,14 @@ def notify(exchange, symbol, kind, score, vr, move, imbalance, reasons):
 
     key = (exchange, symbol, kind)
 
-    if key in sent or len(alert_history) >= MAX_ALERTS:
+    if key in sent or len(alert_history) >= MAX_ALERTS or score < MIN_SCORE:
         return
-
-    if score < MIN_SCORE:
-        return
-
-    sent.add(key)
-    alert_history.append(now)
 
     icon = "🟢" if kind == "PUMP" else "🔴"
     title = "EARLY PUMP" if kind == "PUMP" else "EARLY DUMP"
 
     message = (
-        f"{icon} {title} V3\n\n"
+        f"{icon} {title} V4\n\n"
         f"Exchange: {exchange}\n"
         f"Contract: {symbol}\n"
         f"Direction: {kind}\n"
@@ -222,162 +251,187 @@ def notify(exchange, symbol, kind, score, vr, move, imbalance, reasons):
         f"5m Change: {move:+.2f}%\n"
         f"Order Book Imbalance: {imbalance:.2f}\n\n"
         f"Detection reasons:\n"
-        + "\n".join("• " + x for x in reasons)
-        + "\n\n⚠️ Early warning, not guaranteed prediction."
+        + "\n".join("• " + reason for reason in reasons)
+        + "\n\n⚠️ Early warning, not guaranteed prediction. No automatic trading."
     )
 
-    send(message)
+    if telegram_send(message):
+        sent.add(key)
+        alert_history.append(now)
+        stats[exchange]["signals"] += 1
+
+
+def process_symbol(exchange, symbol, candle_url, candle_params,
+                   book_url, book_params):
+    candles_raw = get(candle_url, candle_params)
+    book = get(book_url, book_params)
+
+    if not isinstance(book, dict):
+        raise ValueError("Unexpected order-book response")
+
+    candles = normalize_candles(candles_raw)
+
+    if len(candles) < 8:
+        raise ValueError("Not enough valid candles")
+
+    vr = volume_ratio(candles)
+    move = price_move(candles)
+    imbalance = book_imbalance(book)
+
+    stats[exchange]["analyzed"] += 1
+
+    for kind in ("PUMP", "DUMP"):
+        score, reasons = evaluate(vr, move, imbalance, kind)
+
+        remember_best(
+            exchange, symbol, kind,
+            score, vr, move, imbalance
+        )
+
+        notify(
+            exchange, symbol, kind,
+            score, vr, move, imbalance, reasons
+        )
 
 
 def scan_bitunix():
-    global errors
-
     tickers = get(f"{BITUNIX}/api/v1/futures/market/tickers")
+
     if not isinstance(tickers, list):
         raise ValueError("Unexpected Bitunix ticker response")
 
     candidates = []
 
-    for x in tickers:
-        try:
-            symbol = x["symbol"]
-            volume = number(x.get("quoteVol"))
+    for item in tickers:
+        symbol = item.get("symbol", "")
+        volume = number(item.get("quoteVol"))
 
-            if symbol.endswith("USDT") and volume > 0:
-                candidates.append((volume, symbol))
-        except Exception:
-            continue
+        if symbol.endswith("USDT") and volume > 0:
+            candidates.append((volume, symbol))
 
     candidates.sort(reverse=True)
-    print("Bitunix candidates:", len(candidates))
+    stats["Bitunix"]["candidates"] = len(candidates)
+
+    print(
+        "Bitunix candidates:", len(candidates),
+        "| selected:", min(TOP, len(candidates))
+    )
 
     for _, symbol in candidates[:TOP]:
         try:
-            candles = get(
+            process_symbol(
+                "Bitunix",
+                symbol,
                 f"{BITUNIX}/api/v1/futures/market/kline",
-                {"symbol": symbol, "interval": "1m", "limit": 20}
-            )
-
-            book = get(
+                {"symbol": symbol, "interval": "1m", "limit": 20},
                 f"{BITUNIX}/api/v1/futures/market/depth",
                 {"symbol": symbol, "limit": 15}
             )
 
-            if not isinstance(book, dict):
-                continue
-
-            candles = normalize_candles(candles)
-
-            if len(candles) < 8:
-                continue
-
-            vr = volume_ratio(candles)
-            move = price_move(candles)
-            imbalance = book_imbalance(book)
-
-            for kind in ("PUMP", "DUMP"):
-                score, reasons = evaluate(
-                    vr, move, imbalance, kind
-                )
-
-                notify(
-                    "Bitunix", symbol, kind,
-                    score, vr, move, imbalance, reasons
-                )
-
-        except Exception as e:
-            errors += 1
-            print("Bitunix error:", symbol, str(e)[:200])
+        except Exception as error:
+            stats["Bitunix"]["errors"] += 1
+            print("Bitunix error:", symbol, str(error)[:200])
 
 
 def scan_toobit():
-    global errors
-
-    try:
-        tickers = get(
-            f"{TOOBIT}/quote/v1/contract/ticker/24hr"
-        )
-    except Exception as e:
-        print("Toobit ticker error:", e)
-        errors += 1
-        return
+    tickers = get(f"{TOOBIT}/quote/v1/contract/ticker/24hr")
 
     if not isinstance(tickers, list):
-        print("Unexpected Toobit ticker format")
-        return
+        raise ValueError("Unexpected Toobit ticker response")
 
     candidates = []
 
-    for x in tickers:
-        try:
-            symbol = x["s"]
-            volume = number(x.get("qv"))
+    for item in tickers:
+        symbol = item.get("s", "")
+        volume = number(item.get("qv"))
 
-            if symbol.endswith("-SWAP-USDT") and volume > 0:
-                candidates.append((volume, symbol))
-        except Exception:
-            continue
+        if symbol.endswith("-SWAP-USDT") and volume > 0:
+            candidates.append((volume, symbol))
 
     candidates.sort(reverse=True)
-    print("Toobit candidates:", len(candidates))
+    stats["Toobit"]["candidates"] = len(candidates)
+
+    print(
+        "Toobit candidates:", len(candidates),
+        "| selected:", min(TOP, len(candidates))
+    )
 
     for _, symbol in candidates[:TOP]:
         try:
-            raw = get(
+            process_symbol(
+                "Toobit",
+                symbol,
                 f"{TOOBIT}/quote/v1/klines",
-                {"symbol": symbol, "interval": "1m", "limit": 20}
-            )
-
-            book = get(
+                {"symbol": symbol, "interval": "1m", "limit": 20},
                 f"{TOOBIT}/quote/v1/depth",
                 {"symbol": symbol, "limit": 20}
             )
 
-            if not isinstance(book, dict):
-                continue
+        except Exception as error:
+            stats["Toobit"]["errors"] += 1
+            print("Toobit error:", symbol, str(error)[:200])
 
-            candles = normalize_candles(raw)
 
-            if len(candles) < 8:
-                continue
+def print_report():
+    print("\n========== V4 SCAN REPORT ==========")
 
-            vr = volume_ratio(candles)
-            move = price_move(candles)
-            imbalance = book_imbalance(book)
+    print("Telegram token configured:", bool(TOKEN))
+    print("Telegram chat ID configured:", bool(CHAT_ID))
+    print("Minimum score:", MIN_SCORE)
+    print("Candidates selected per exchange:", TOP)
 
-            for kind in ("PUMP", "DUMP"):
-                score, reasons = evaluate(
-                    vr, move, imbalance, kind
-                )
+    for exchange, data in stats.items():
+        print(
+            f"{exchange}: candidates={data['candidates']}, "
+            f"analyzed={data['analyzed']}, "
+            f"errors={data['errors']}, "
+            f"signals_sent={data['signals']}"
+        )
 
-                notify(
-                    "Toobit", symbol, kind,
-                    score, vr, move, imbalance, reasons
-                )
+    for kind, label in (
+        ("PUMP", "TOP PUMP SCORES"),
+        ("DUMP", "TOP DUMP SCORES")
+    ):
+        print("\n" + label)
 
-        except Exception as e:
-            errors += 1
-            print("Toobit error:", symbol, str(e)[:200])
+        if not best_scores[kind]:
+            print("No valid scores recorded.")
+
+        for item in best_scores[kind]:
+            print(
+                f"{item['exchange']} {item['symbol']} "
+                f"score={item['score']} "
+                f"volume={item['volume']:.2f}x "
+                f"move={item['move']:+.2f}% "
+                f"imbalance={item['imbalance']:.2f}"
+            )
+
+    print("====================================")
+    print("No automatic trading.")
 
 
 def main():
-    print("EARLY PUMP & DUMP SCANNER V3")
+    print("EARLY PUMP & DUMP SCANNER V4")
     print("One-shot scan started.")
-    print("No automatic trading.")
+
+    if not TOKEN or not CHAT_ID:
+        print("WARNING: Telegram credentials are missing.")
 
     try:
         scan_bitunix()
-    except Exception as e:
-        print("Bitunix scan failed:", e)
+    except Exception as error:
+        stats["Bitunix"]["errors"] += 1
+        print("Bitunix scan failed:", str(error)[:250])
 
     try:
         scan_toobit()
-    except Exception as e:
-        print("Toobit scan failed:", e)
+    except Exception as error:
+        stats["Toobit"]["errors"] += 1
+        print("Toobit scan failed:", str(error)[:250])
 
-    print("Scan completed.")
-    print("Errors:", errors)
+    print_report()
 
 
 if __name__ == "__main__":
     main()
+    
