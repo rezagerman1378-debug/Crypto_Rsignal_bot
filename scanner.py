@@ -1,12 +1,11 @@
-
 import os
 import time
 import statistics
 import requests
-from collections import deque
+from collections import defaultdict, deque
 
 # Early Pump + Dump Scanner V4
-# Conservative alerts only. No automatic trading.
+# Conservative alerts only. This script does NOT place trades.
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -23,12 +22,10 @@ session.headers.update({"User-Agent": "EarlyScanner-V4"})
 
 alert_history = deque()
 sent = set()
-
 stats = {
     "Bitunix": {"candidates": 0, "analyzed": 0, "errors": 0, "signals": 0},
     "Toobit": {"candidates": 0, "analyzed": 0, "errors": 0, "signals": 0},
 }
-
 best_scores = {"PUMP": [], "DUMP": []}
 
 
@@ -60,7 +57,6 @@ def telegram_send(message):
         },
         timeout=15
     )
-
     response.raise_for_status()
     result = response.json()
 
@@ -90,7 +86,6 @@ def normalize_candles(raw):
                 opening = number(candle.get("open"))
                 closing = number(candle.get("close"))
                 quote_volume = number(candle.get("quoteVol"))
-
                 if not quote_volume:
                     quote_volume = number(candle.get("baseVol")) * closing
             else:
@@ -106,7 +101,6 @@ def normalize_candles(raw):
                     "close": closing,
                     "volume": quote_volume
                 })
-
         except (IndexError, TypeError, KeyError):
             continue
 
@@ -140,8 +134,8 @@ def book_imbalance(book):
 
     bid_value = sum(number(x[0]) * number(x[1]) for x in bids[:10])
     ask_value = sum(number(x[0]) * number(x[1]) for x in asks[:10])
-
     total = bid_value + ask_value
+
     return bid_value / total if total else 0.5
 
 
@@ -182,7 +176,6 @@ def evaluate(vr, move, imbalance, kind):
             score += 14
         elif imbalance <= 0.35:
             score -= 12
-
     else:
         if -1.5 <= move <= -0.15:
             score += 24
@@ -209,6 +202,8 @@ def evaluate(vr, move, imbalance, kind):
         score = min(score, 55)
 
     return max(0, min(100, score)), reasons
+
+
 def remember_best(exchange, symbol, kind, score, vr, move, imbalance):
     item = {
         "exchange": exchange,
@@ -218,12 +213,8 @@ def remember_best(exchange, symbol, kind, score, vr, move, imbalance):
         "move": move,
         "imbalance": imbalance
     }
-
     best_scores[kind].append(item)
-    best_scores[kind].sort(
-        key=lambda x: x["score"],
-        reverse=True
-    )
+    best_scores[kind].sort(key=lambda x: x["score"], reverse=True)
     del best_scores[kind][5:]
 
 
@@ -255,6 +246,7 @@ def notify(exchange, symbol, kind, score, vr, move, imbalance, reasons):
         + "\n\n⚠️ Early warning, not guaranteed prediction. No automatic trading."
     )
 
+    # Mark as sent only after Telegram confirms acceptance.
     if telegram_send(message):
         sent.add(key)
         alert_history.append(now)
@@ -270,7 +262,6 @@ def process_symbol(exchange, symbol, candle_url, candle_params,
         raise ValueError("Unexpected order-book response")
 
     candles = normalize_candles(candles_raw)
-
     if len(candles) < 8:
         raise ValueError("Not enough valid candles")
 
@@ -282,52 +273,35 @@ def process_symbol(exchange, symbol, candle_url, candle_params,
 
     for kind in ("PUMP", "DUMP"):
         score, reasons = evaluate(vr, move, imbalance, kind)
-
-        remember_best(
-            exchange, symbol, kind,
-            score, vr, move, imbalance
-        )
-
-        notify(
-            exchange, symbol, kind,
-            score, vr, move, imbalance, reasons
-        )
+        remember_best(exchange, symbol, kind, score, vr, move, imbalance)
+        notify(exchange, symbol, kind, score, vr, move, imbalance, reasons)
 
 
 def scan_bitunix():
     tickers = get(f"{BITUNIX}/api/v1/futures/market/tickers")
-
     if not isinstance(tickers, list):
         raise ValueError("Unexpected Bitunix ticker response")
 
     candidates = []
-
     for item in tickers:
         symbol = item.get("symbol", "")
         volume = number(item.get("quoteVol"))
-
         if symbol.endswith("USDT") and volume > 0:
             candidates.append((volume, symbol))
 
     candidates.sort(reverse=True)
     stats["Bitunix"]["candidates"] = len(candidates)
-
-    print(
-        "Bitunix candidates:", len(candidates),
-        "| selected:", min(TOP, len(candidates))
-    )
+    print("Bitunix candidates:", len(candidates), "| selected:", min(TOP, len(candidates)))
 
     for _, symbol in candidates[:TOP]:
         try:
             process_symbol(
-                "Bitunix",
-                symbol,
+                "Bitunix", symbol,
                 f"{BITUNIX}/api/v1/futures/market/kline",
                 {"symbol": symbol, "interval": "1m", "limit": 20},
                 f"{BITUNIX}/api/v1/futures/market/depth",
                 {"symbol": symbol, "limit": 15}
             )
-
         except Exception as error:
             stats["Bitunix"]["errors"] += 1
             print("Bitunix error:", symbol, str(error)[:200])
@@ -335,38 +309,29 @@ def scan_bitunix():
 
 def scan_toobit():
     tickers = get(f"{TOOBIT}/quote/v1/contract/ticker/24hr")
-
     if not isinstance(tickers, list):
         raise ValueError("Unexpected Toobit ticker response")
 
     candidates = []
-
     for item in tickers:
         symbol = item.get("s", "")
         volume = number(item.get("qv"))
-
         if symbol.endswith("-SWAP-USDT") and volume > 0:
             candidates.append((volume, symbol))
 
     candidates.sort(reverse=True)
     stats["Toobit"]["candidates"] = len(candidates)
-
-    print(
-        "Toobit candidates:", len(candidates),
-        "| selected:", min(TOP, len(candidates))
-    )
+    print("Toobit candidates:", len(candidates), "| selected:", min(TOP, len(candidates)))
 
     for _, symbol in candidates[:TOP]:
         try:
             process_symbol(
-                "Toobit",
-                symbol,
+                "Toobit", symbol,
                 f"{TOOBIT}/quote/v1/klines",
                 {"symbol": symbol, "interval": "1m", "limit": 20},
                 f"{TOOBIT}/quote/v1/depth",
                 {"symbol": symbol, "limit": 20}
             )
-
         except Exception as error:
             stats["Toobit"]["errors"] += 1
             print("Toobit error:", symbol, str(error)[:200])
@@ -374,7 +339,6 @@ def scan_toobit():
 
 def print_report():
     print("\n========== V4 SCAN REPORT ==========")
-
     print("Telegram token configured:", bool(TOKEN))
     print("Telegram chat ID configured:", bool(CHAT_ID))
     print("Minimum score:", MIN_SCORE)
@@ -383,27 +347,19 @@ def print_report():
     for exchange, data in stats.items():
         print(
             f"{exchange}: candidates={data['candidates']}, "
-            f"analyzed={data['analyzed']}, "
-            f"errors={data['errors']}, "
+            f"analyzed={data['analyzed']}, errors={data['errors']}, "
             f"signals_sent={data['signals']}"
         )
 
-    for kind, label in (
-        ("PUMP", "TOP PUMP SCORES"),
-        ("DUMP", "TOP DUMP SCORES")
-    ):
+    for kind, label in (("PUMP", "TOP PUMP SCORES"), ("DUMP", "TOP DUMP SCORES")):
         print("\n" + label)
-
         if not best_scores[kind]:
             print("No valid scores recorded.")
-
         for item in best_scores[kind]:
             print(
                 f"{item['exchange']} {item['symbol']} "
-                f"score={item['score']} "
-                f"volume={item['volume']:.2f}x "
-                f"move={item['move']:+.2f}% "
-                f"imbalance={item['imbalance']:.2f}"
+                f"score={item['score']} volume={item['volume']:.2f}x "
+                f"move={item['move']:+.2f}% imbalance={item['imbalance']:.2f}"
             )
 
     print("====================================")
@@ -415,7 +371,7 @@ def main():
     print("One-shot scan started.")
 
     if not TOKEN or not CHAT_ID:
-        print("WARNING: Telegram credentials are missing.")
+        print("WARNING: Telegram credentials are missing from environment.")
 
     try:
         scan_bitunix()
@@ -434,4 +390,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
