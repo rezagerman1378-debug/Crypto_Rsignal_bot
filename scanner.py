@@ -1,391 +1,940 @@
 import os
+import json
 import time
-import statistics
 import requests
-from collections import defaultdict, deque
+from datetime import datetime, timezone
+from collections import defaultdict
 
-# Early Pump + Dump Scanner V4
-# Conservative alerts only. This script does NOT place trades.
-
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-MIN_SCORE = int(os.getenv("MIN_SCORE", "75"))
-MAX_ALERTS = int(os.getenv("MAX_ALERTS_PER_HOUR", "5"))
-TOP = int(os.getenv("TOP_CANDIDATES", "30"))
+VERSION = "V5"
 
 BITUNIX = "https://fapi.bitunix.com"
 TOOBIT = "https://api.toobit.com"
 
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+TOP_CANDIDATES = int(os.getenv("TOP_CANDIDATES", "100"))
+MAX_ALERTS_PER_HOUR = int(os.getenv("MAX_ALERTS_PER_HOUR", "5"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "90"))
+
+STATE_FILE = "scanner_state.json"
+TIMEOUT = 12
+
 session = requests.Session()
-session.headers.update({"User-Agent": "EarlyScanner-V4"})
-
-alert_history = deque()
-sent = set()
-stats = {
-    "Bitunix": {"candidates": 0, "analyzed": 0, "errors": 0, "signals": 0},
-    "Toobit": {"candidates": 0, "analyzed": 0, "errors": 0, "signals": 0},
-}
-best_scores = {"PUMP": [], "DUMP": []}
+session.headers.update({
+    "User-Agent": "Early-Pump-Dump-Scanner-V5",
+    "Accept": "application/json"
+})
 
 
-def get(url, params=None):
-    response = session.get(url, params=params, timeout=15)
-    response.raise_for_status()
-    data = response.json()
+# ==========================================
+# GENERAL HELPERS
+# ==========================================
 
-    if isinstance(data, dict):
-        code = data.get("code")
-        if code not in (None, 0, "0"):
-            raise ValueError(str(data.get("msg", "API error")))
-        return data.get("data", data)
-
-    return data
+def now_ts():
+    return int(time.time())
 
 
-def telegram_send(message):
-    if not TOKEN or not CHAT_ID:
-        print("TELEGRAM NOT CONFIGURED: token or chat_id is empty.")
-        return False
-
-    response = session.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": True
-        },
-        timeout=15
-    )
-    response.raise_for_status()
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError("Telegram API rejected message: " + str(result))
-
-    print("TELEGRAM SENT: message accepted by Telegram.")
-    return True
-
-
-def number(value, default=0):
+def safe_float(value, default=0.0):
     try:
-        return float(value)
-    except (ValueError, TypeError):
+        result = float(value)
+        if result != result or result in (float("inf"), float("-inf")):
+            return default
+        return result
+    except (TypeError, ValueError):
         return default
 
 
-def normalize_candles(raw):
-    result = []
+def get_json(url, params=None):
+    try:
+        response = session.get(
+            url,
+            params=params,
+            timeout=TIMEOUT
+        )
+        response.raise_for_status()
+        data = response.json()
 
-    if isinstance(raw, dict):
-        raw = raw.get("list", raw.get("rows", []))
+        if isinstance(data, dict):
+            code = data.get("code")
+            if code not in (None, 0, "0", 200, "200"):
+                return None
 
-    for candle in raw or []:
-        try:
-            if isinstance(candle, dict):
-                opening = number(candle.get("open"))
-                closing = number(candle.get("close"))
-                quote_volume = number(candle.get("quoteVol"))
-                if not quote_volume:
-                    quote_volume = number(candle.get("baseVol")) * closing
-            else:
-                opening = number(candle[1])
-                closing = number(candle[4])
-                quote_volume = number(
-                    candle[7] if len(candle) > 7 else candle[5]
-                )
+            if "data" in data:
+                return data["data"]
 
-            if opening > 0 and closing > 0:
-                result.append({
-                    "open": opening,
-                    "close": closing,
-                    "volume": quote_volume
-                })
-        except (IndexError, TypeError, KeyError):
+        return data
+
+    except Exception as exc:
+        print("API error:", url, str(exc)[:180])
+        return None
+
+
+def normalize_base(exchange, symbol):
+    symbol = str(symbol).upper().strip()
+
+    if exchange == "Toobit":
+        symbol = symbol.replace("-SWAP-USDT", "")
+
+    if symbol.endswith("USDT"):
+        symbol = symbol[:-4]
+
+    return symbol.replace("-", "").replace("_", "")
+
+
+def toobit_symbol(base):
+    return base + "-SWAP-USDT"
+
+
+# ==========================================
+# TELEGRAM
+# ==========================================
+
+def telegram_send(message):
+    if not TOKEN or not CHAT_ID:
+        print("Telegram credentials missing")
+        return False
+
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
+    try:
+        response = session.post(
+            url,
+            json={
+                "chat_id": CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True
+            },
+            timeout=TIMEOUT
+        )
+        response.raise_for_status()
+        result = response.json()
+        return bool(result.get("ok"))
+
+    except Exception as exc:
+        print("Telegram error:", str(exc)[:180])
+        return False
+
+
+# ==========================================
+# BITUNIX MARKET DATA
+# ==========================================
+
+def bitunix_tickers():
+    data = get_json(
+        BITUNIX + "/api/v1/futures/market/tickers"
+    )
+
+    if not isinstance(data, list):
+        return []
+
+    markets = []
+
+    for item in data:
+        symbol = item.get("symbol", "")
+        base = normalize_base("Bitunix", symbol)
+
+        if not base or not symbol.endswith("USDT"):
             continue
+
+        volume = safe_float(item.get("quoteVol"))
+        price = safe_float(item.get("lastPrice"))
+
+        if volume <= 0 or price <= 0:
+            continue
+
+        markets.append({
+            "exchange": "Bitunix",
+            "symbol": symbol,
+            "base": base,
+            "price": price,
+            "volume": volume,
+            "change24": (
+                (price / safe_float(item.get("open")) - 1) * 100
+                if safe_float(item.get("open")) > 0 else 0
+            )
+        })
+
+    return sorted(
+        markets,
+        key=lambda x: x["volume"],
+        reverse=True
+    )
+
+
+def bitunix_candles(symbol):
+    data = get_json(
+        BITUNIX + "/api/v1/futures/market/kline",
+        {
+            "symbol": symbol,
+            "interval": "5m",
+            "limit": 100
+        }
+    )
+
+    if not isinstance(data, list):
+        return []
+
+    candles = []
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        candles.append({
+            "time": safe_float(item.get("time")),
+            "open": safe_float(item.get("open")),
+            "high": safe_float(item.get("high")),
+            "low": safe_float(item.get("low")),
+            "close": safe_float(item.get("close")),
+            "volume": safe_float(item.get("quoteVol"))
+        })
+
+    return sorted(candles, key=lambda x: x["time"])
+
+
+def bitunix_book(symbol):
+    data = get_json(
+        BITUNIX + "/api/v1/futures/market/depth",
+        {
+            "symbol": symbol,
+            "limit": "15"
+        }
+    )
+
+    if not isinstance(data, dict):
+        return None
+
+    return {
+        "bids": data.get("bids", []),
+        "asks": data.get("asks", [])
+    }
+
+
+def bitunix_funding_all():
+    data = get_json(
+        BITUNIX + "/api/v1/futures/market/funding_rate/batch"
+    )
+
+    result = {}
+
+    if isinstance(data, list):
+        for item in data:
+            symbol = item.get("symbol", "")
+            result[symbol] = safe_float(item.get("fundingRate"))
 
     return result
 
 
+# ==========================================
+# TOOBIT MARKET DATA
+# ==========================================
+
+def toobit_tickers():
+    data = get_json(
+        TOOBIT + "/quote/v1/contract/ticker/24hr"
+    )
+
+    if not isinstance(data, list):
+        return []
+
+    markets = []
+
+    for item in data:
+        symbol = item.get("s", "")
+
+        if not symbol.endswith("-SWAP-USDT"):
+            continue
+
+        base = normalize_base("Toobit", symbol)
+        price = safe_float(item.get("c"))
+        volume = safe_float(item.get("qv"))
+
+        if not base or price <= 0 or volume <= 0:
+            continue
+
+        markets.append({
+            "exchange": "Toobit",
+            "symbol": symbol,
+            "base": base,
+            "price": price,
+            "volume": volume,
+            "change24": safe_float(item.get("pcp"))
+        })
+
+    return sorted(
+        markets,
+        key=lambda x: x["volume"],
+        reverse=True
+    )
+
+
+def toobit_candles(symbol):
+    end_time = int(time.time() * 1000)
+    start_time = end_time - (100 * 5 * 60 * 1000)
+
+    data = get_json(
+        TOOBIT + "/quote/v1/klines",
+        {
+            "symbol": symbol,
+            "interval": "5m",
+            "startTime": start_time,
+            "endTime": end_time,
+            "limit": 100
+        }
+    )
+
+    if not isinstance(data, list):
+        return []
+
+    candles = []
+
+    for item in data:
+        if not isinstance(item, list) or len(item) < 6:
+            continue
+
+        candles.append({
+            "time": safe_float(item[0]),
+            "open": safe_float(item[1]),
+            "high": safe_float(item[2]),
+            "low": safe_float(item[3]),
+            "close": safe_float(item[4]),
+            "volume": safe_float(item[7] if len(item) > 7 else item[5])
+        })
+
+    return sorted(candles, key=lambda x: x["time"])
+
+
+def toobit_book(symbol):
+    data = get_json(
+        TOOBIT + "/quote/v1/depth",
+        {
+            "symbol": symbol,
+            "limit": 20
+        }
+    )
+
+    if not isinstance(data, dict):
+        return None
+
+    return {
+        "bids": data.get("b", []),
+        "asks": data.get("a", [])
+    }
+
+
+def toobit_funding(symbol):
+    data = get_json(
+        TOOBIT + "/api/v1/futures/fundingRate",
+        {"symbol": symbol}
+    )
+
+    if isinstance(data, list) and data:
+        return safe_float(data[0].get("rate"))
+
+    return None
+
+
+def toobit_open_interest(symbol):
+    data = get_json(
+        TOOBIT + "/quote/v1/openInterest",
+        {"symbol": symbol}
+    )
+
+    if not isinstance(data, dict):
+        return None
+
+    rows = data.get("openInterestList", [])
+
+    for item in rows:
+        if item.get("symbol") == symbol:
+            return safe_float(item.get("size"))
+
+    return None
+
+
+# ==========================================
+# CANDIDATE COLLECTION
+# ==========================================
+
+def get_candidates():
+    bitunix = bitunix_tickers()
+    toobit = toobit_tickers()
+
+    print("Bitunix markets:", len(bitunix))
+    print("Toobit markets:", len(toobit))
+
+    bitunix = bitunix[:TOP_CANDIDATES]
+    toobit = toobit[:TOP_CANDIDATES]
+
+    combined = bitunix + toobit
+
+    grouped = defaultdict(list)
+
+    for market in combined:
+        grouped[market["base"]].append(market)
+
+    unique = []
+
+    for base, choices in grouped.items():
+        # Toobit has documented public OI data.
+        # Prefer it when the same asset exists on both venues.
+        choices.sort(
+            key=lambda x: (
+                x["exchange"] == "Toobit",
+                x["volume"]
+            ),
+            reverse=True
+        )
+
+        unique.append(choices[0])
+
+    unique.sort(
+        key=lambda x: x["volume"],
+        reverse=True
+    )
+
+    print("Unique assets selected:", len(unique))
+
+    return unique
+
+# ==========================================
+# STATE MANAGEMENT
+# ==========================================
+
+def load_state():
+    default = {
+        "alerts": {},
+        "oi_history": {},
+        "sent_times": []
+    }
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as file:
+            saved = json.load(file)
+
+        if isinstance(saved, dict):
+            for key in default:
+                if key in saved:
+                    default[key] = saved[key]
+
+    except Exception:
+        pass
+
+    return default
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as file:
+            json.dump(state, file, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print("State save error:", exc)
+
+
+# ==========================================
+# MARKET CALCULATIONS
+# ==========================================
+
 def volume_ratio(candles):
-    if len(candles) < 8:
-        return 1.0
+    if len(candles) < 22:
+        return 0
 
-    previous_volumes = [x["volume"] for x in candles[-8:-1]]
-    current_volume = candles[-1]["volume"]
-    average_volume = statistics.mean(previous_volumes)
+    previous = [
+        c["volume"] for c in candles[-22:-2]
+        if c["volume"] > 0
+    ]
 
-    return current_volume / average_volume if average_volume > 0 else 1.0
+    if len(previous) < 10:
+        return 0
+
+    average = sum(previous) / len(previous)
+    latest = candles[-1]["volume"]
+
+    if average <= 0:
+        return 0
+
+    return latest / average
 
 
-def price_move(candles, periods=5):
-    if len(candles) <= periods:
-        return 0.0
+def price_momentum(candles):
+    if len(candles) < 5:
+        return 0
 
-    old_price = candles[-periods - 1]["close"]
+    old_price = candles[-5]["close"]
     new_price = candles[-1]["close"]
 
-    return (new_price / old_price - 1) * 100 if old_price else 0.0
+    if old_price <= 0:
+        return 0
+
+    return ((new_price / old_price) - 1) * 100
+
+
+def recent_move(candles, count=8):
+    if len(candles) < count + 1:
+        return 0
+
+    old_price = candles[-count-1]["close"]
+    new_price = candles[-1]["close"]
+
+    if old_price <= 0:
+        return 0
+
+    return ((new_price / old_price) - 1) * 100
 
 
 def book_imbalance(book):
+    if not book:
+        return None
+
     bids = book.get("bids", [])
     asks = book.get("asks", [])
 
-    bid_value = sum(number(x[0]) * number(x[1]) for x in bids[:10])
-    ask_value = sum(number(x[0]) * number(x[1]) for x in asks[:10])
-    total = bid_value + ask_value
+    def total_qty(rows):
+        total = 0
 
-    return bid_value / total if total else 0.5
+        for row in rows[:15]:
+            try:
+                if isinstance(row, dict):
+                    qty = safe_float(
+                        row.get("qty", row.get("volume"))
+                    )
+                else:
+                    qty = safe_float(row[1])
+
+                total += qty
+
+            except Exception:
+                continue
+
+        return total
+
+    bid_total = total_qty(bids)
+    ask_total = total_qty(asks)
+
+    if bid_total <= 0 or ask_total <= 0:
+        return None
+
+    return bid_total / (bid_total + ask_total)
 
 
-def evaluate(vr, move, imbalance, kind):
+# ==========================================
+# OPEN INTEREST CHANGE
+# ==========================================
+
+def update_oi_history(base, current_oi, state):
+    if current_oi is None or current_oi <= 0:
+        return None
+
+    history = state.setdefault("oi_history", {})
+    old = history.get(base)
+
+    history[base] = {
+        "value": current_oi,
+        "time": now_ts()
+    }
+
+    if not old:
+        return None
+
+    old_value = safe_float(old.get("value"))
+    old_time = int(old.get("time", 0))
+
+    if old_value <= 0 or now_ts() - old_time < 240:
+        return None
+
+    change = ((current_oi / old_value) - 1) * 100
+
+    return change
+
+
+# ==========================================
+# SCORING
+# ==========================================
+
+def evaluate_signal(
+    candles,
+    book,
+    funding=None,
+    oi_change=None
+):
+    if len(candles) < 25:
+        return None
+
+    momentum = price_momentum(candles)
+    volume = volume_ratio(candles)
+    move = recent_move(candles, 8)
+    imbalance = book_imbalance(book)
+
+    direction = "PUMP" if momentum >= 0 else "DUMP"
+
     score = 0
     reasons = []
 
-    if vr >= 5:
-        score += 28
-        reasons.append("حجم معاملات بسیار غیرعادی")
-    elif vr >= 3:
-        score += 23
-        reasons.append("افزایش شدید حجم")
-    elif vr >= 2:
-        score += 16
-        reasons.append("افزایش حجم معاملات")
-    elif vr >= 1.5:
-        score += 9
+    # Volume spike
+    if volume >= 3:
+        score += 25
+        reasons.append("حجم بسیار بالا")
+    elif volume >= 2:
+        score += 20
+        reasons.append("افزایش حجم")
+    elif volume >= 1.5:
+        score += 12
+        reasons.append("رشد نسبی حجم")
 
-    if kind == "PUMP":
-        if 0.15 <= move <= 1.5:
-            score += 24
-            reasons.append("شتاب اولیه صعودی")
-        elif 1.5 < move <= 3:
-            score += 17
-        elif 3 < move <= 5:
-            score += 7
-        elif move > 5:
-            score -= 20
-            reasons.append("حرکت صعودی بیش از حد")
-        elif move < -0.5:
-            score -= 12
+    # Price momentum
+    abs_momentum = abs(momentum)
 
-        if imbalance >= 0.70:
-            score += 23
-            reasons.append("غلبه سفارش‌های خرید")
-        elif imbalance >= 0.60:
-            score += 14
-        elif imbalance <= 0.35:
-            score -= 12
+    if abs_momentum >= 1.8:
+        score += 25
+        reasons.append("شتاب قیمت قوی")
+    elif abs_momentum >= 1.0:
+        score += 18
+        reasons.append("شتاب قیمت")
+    elif abs_momentum >= 0.5:
+        score += 10
+        reasons.append("حرکت اولیه قیمت")
+
+    # Order book imbalance
+    if imbalance is not None:
+        if direction == "PUMP" and imbalance >= 0.65:
+            score += 20
+            reasons.append("برتری سفارش خرید")
+        elif direction == "DUMP" and imbalance <= 0.35:
+            score += 20
+            reasons.append("برتری سفارش فروش")
+        elif direction == "PUMP" and imbalance >= 0.57:
+            score += 10
+        elif direction == "DUMP" and imbalance <= 0.43:
+            score += 10
+
+    # Open interest change
+    if oi_change is not None:
+        if oi_change >= 2:
+            score += 15
+            reasons.append("افزایش Open Interest")
+        elif oi_change >= 0.8:
+            score += 8
+            reasons.append("رشد نسبی Open Interest")
+        elif oi_change <= -2:
+            score -= 8
+            reasons.append("کاهش Open Interest")
+
+    # Funding is contextual, not a standalone signal
+    if funding is not None:
+        if direction == "PUMP" and funding > 0.001:
+            score -= 5
+            reasons.append("Funding مثبت و نسبتاً بالا")
+        elif direction == "DUMP" and funding < -0.001:
+            score -= 5
+            reasons.append("Funding منفی و نسبتاً پایین")
+
+    # Avoid chasing an already extended move
+    if direction == "PUMP" and move >= 5:
+        score -= 25
+        reasons.append("رشد اخیر بیش از حد")
+    elif direction == "DUMP" and move <= -5:
+        score -= 25
+        reasons.append("ریزش اخیر بیش از حد")
+    elif abs(move) >= 3.5:
+        score -= 12
+        reasons.append("حرکت اخیر کشیده شده")
+
+    score = max(0, min(100, score))
+
+    if score < 40:
+        stage = 0
+    elif score < 55:
+        stage = 1
+    elif score < 70:
+        stage = 2
     else:
-        if -1.5 <= move <= -0.15:
-            score += 24
-            reasons.append("شتاب اولیه نزولی")
-        elif -3 <= move < -1.5:
-            score += 17
-        elif -5 <= move < -3:
-            score += 7
-        elif move < -5:
-            score -= 20
-            reasons.append("حرکت نزولی بیش از حد")
-        elif move > 0.5:
-            score -= 12
+        stage = 3
 
-        if imbalance <= 0.30:
-            score += 23
-            reasons.append("غلبه سفارش‌های فروش")
-        elif imbalance <= 0.40:
-            score += 14
-        elif imbalance >= 0.65:
-            score -= 12
-
-    if vr < 1.5:
-        score = min(score, 55)
-
-    return max(0, min(100, score)), reasons
-
-
-def remember_best(exchange, symbol, kind, score, vr, move, imbalance):
-    item = {
-        "exchange": exchange,
-        "symbol": symbol,
+    return {
         "score": score,
-        "volume": vr,
-        "move": move,
-        "imbalance": imbalance
+        "direction": direction,
+        "stage": stage,
+        "momentum": momentum,
+        "volume_ratio": volume,
+        "oi_change": oi_change,
+        "funding": funding,
+        "imbalance": imbalance,
+        "reasons": reasons
     }
-    best_scores[kind].append(item)
-    best_scores[kind].sort(key=lambda x: x["score"], reverse=True)
-    del best_scores[kind][5:]
 
 
-def notify(exchange, symbol, kind, score, vr, move, imbalance, reasons):
-    now = time.time()
+# ==========================================
+# ANALYZE ONE MARKET
+# ==========================================
 
-    while alert_history and now - alert_history[0] > 3600:
-        alert_history.popleft()
+def analyze_market(market, state, bitunix_funding):
+    exchange = market["exchange"]
+    symbol = market["symbol"]
+    base = market["base"]
 
-    key = (exchange, symbol, kind)
+    if exchange == "Bitunix":
+        candles = bitunix_candles(symbol)
+        book = bitunix_book(symbol)
+        funding = bitunix_funding.get(symbol)
+        oi_change = None
 
-    if key in sent or len(alert_history) >= MAX_ALERTS or score < MIN_SCORE:
-        return
+    else:
+        candles = toobit_candles(symbol)
+        book = toobit_book(symbol)
+        funding = toobit_funding(symbol)
 
-    icon = "🟢" if kind == "PUMP" else "🔴"
-    title = "EARLY PUMP" if kind == "PUMP" else "EARLY DUMP"
-
-    message = (
-        f"{icon} {title} V4\n\n"
-        f"Exchange: {exchange}\n"
-        f"Contract: {symbol}\n"
-        f"Direction: {kind}\n"
-        f"Score: {score}/100\n\n"
-        f"Volume: {vr:.2f}x\n"
-        f"5m Change: {move:+.2f}%\n"
-        f"Order Book Imbalance: {imbalance:.2f}\n\n"
-        f"Detection reasons:\n"
-        + "\n".join("• " + reason for reason in reasons)
-        + "\n\n⚠️ Early warning, not guaranteed prediction. No automatic trading."
-    )
-
-    # Mark as sent only after Telegram confirms acceptance.
-    if telegram_send(message):
-        sent.add(key)
-        alert_history.append(now)
-        stats[exchange]["signals"] += 1
-
-
-def process_symbol(exchange, symbol, candle_url, candle_params,
-                   book_url, book_params):
-    candles_raw = get(candle_url, candle_params)
-    book = get(book_url, book_params)
-
-    if not isinstance(book, dict):
-        raise ValueError("Unexpected order-book response")
-
-    candles = normalize_candles(candles_raw)
-    if len(candles) < 8:
-        raise ValueError("Not enough valid candles")
-
-    vr = volume_ratio(candles)
-    move = price_move(candles)
-    imbalance = book_imbalance(book)
-
-    stats[exchange]["analyzed"] += 1
-
-    for kind in ("PUMP", "DUMP"):
-        score, reasons = evaluate(vr, move, imbalance, kind)
-        remember_best(exchange, symbol, kind, score, vr, move, imbalance)
-        notify(exchange, symbol, kind, score, vr, move, imbalance, reasons)
-
-
-def scan_bitunix():
-    tickers = get(f"{BITUNIX}/api/v1/futures/market/tickers")
-    if not isinstance(tickers, list):
-        raise ValueError("Unexpected Bitunix ticker response")
-
-    candidates = []
-    for item in tickers:
-        symbol = item.get("symbol", "")
-        volume = number(item.get("quoteVol"))
-        if symbol.endswith("USDT") and volume > 0:
-            candidates.append((volume, symbol))
-
-    candidates.sort(reverse=True)
-    stats["Bitunix"]["candidates"] = len(candidates)
-    print("Bitunix candidates:", len(candidates), "| selected:", min(TOP, len(candidates)))
-
-    for _, symbol in candidates[:TOP]:
-        try:
-            process_symbol(
-                "Bitunix", symbol,
-                f"{BITUNIX}/api/v1/futures/market/kline",
-                {"symbol": symbol, "interval": "1m", "limit": 20},
-                f"{BITUNIX}/api/v1/futures/market/depth",
-                {"symbol": symbol, "limit": 15}
-            )
-        except Exception as error:
-            stats["Bitunix"]["errors"] += 1
-            print("Bitunix error:", symbol, str(error)[:200])
-
-
-def scan_toobit():
-    tickers = get(f"{TOOBIT}/quote/v1/contract/ticker/24hr")
-    if not isinstance(tickers, list):
-        raise ValueError("Unexpected Toobit ticker response")
-
-    candidates = []
-    for item in tickers:
-        symbol = item.get("s", "")
-        volume = number(item.get("qv"))
-        if symbol.endswith("-SWAP-USDT") and volume > 0:
-            candidates.append((volume, symbol))
-
-    candidates.sort(reverse=True)
-    stats["Toobit"]["candidates"] = len(candidates)
-    print("Toobit candidates:", len(candidates), "| selected:", min(TOP, len(candidates)))
-
-    for _, symbol in candidates[:TOP]:
-        try:
-            process_symbol(
-                "Toobit", symbol,
-                f"{TOOBIT}/quote/v1/klines",
-                {"symbol": symbol, "interval": "1m", "limit": 20},
-                f"{TOOBIT}/quote/v1/depth",
-                {"symbol": symbol, "limit": 20}
-            )
-        except Exception as error:
-            stats["Toobit"]["errors"] += 1
-            print("Toobit error:", symbol, str(error)[:200])
-
-
-def print_report():
-    print("\n========== V4 SCAN REPORT ==========")
-    print("Telegram token configured:", bool(TOKEN))
-    print("Telegram chat ID configured:", bool(CHAT_ID))
-    print("Minimum score:", MIN_SCORE)
-    print("Candidates selected per exchange:", TOP)
-
-    for exchange, data in stats.items():
-        print(
-            f"{exchange}: candidates={data['candidates']}, "
-            f"analyzed={data['analyzed']}, errors={data['errors']}, "
-            f"signals_sent={data['signals']}"
+        current_oi = toobit_open_interest(symbol)
+        oi_change = update_oi_history(
+            base,
+            current_oi,
+            state
         )
 
-    for kind, label in (("PUMP", "TOP PUMP SCORES"), ("DUMP", "TOP DUMP SCORES")):
-        print("\n" + label)
-        if not best_scores[kind]:
-            print("No valid scores recorded.")
-        for item in best_scores[kind]:
-            print(
-                f"{item['exchange']} {item['symbol']} "
-                f"score={item['score']} volume={item['volume']:.2f}x "
-                f"move={item['move']:+.2f}% imbalance={item['imbalance']:.2f}"
-            )
+        # Small delay to respect public API rate limits
+        time.sleep(0.15)
 
-    print("====================================")
-    print("No automatic trading.")
+    signal = evaluate_signal(
+        candles,
+        book,
+        funding,
+        oi_change
+    )
 
+    if not signal:
+        return None
+
+    signal.update({
+        "exchange": exchange,
+        "symbol": symbol,
+        "base": base,
+        "price": market["price"],
+        "volume24": market["volume"]
+    })
+
+    return signal
+
+
+# ==========================================
+# ALERT STAGES
+# ==========================================
+
+def stage_name(stage):
+    return {
+        1: "🟡 آماده‌باش",
+        2: "🟠 هشدار قوی",
+        3: "🔴 سیگنال نهایی"
+    }.get(stage, "")
+
+
+def should_send_alert(result, state):
+    if result["stage"] == 0:
+        return False
+
+    key = result["base"] + "_" + result["direction"]
+    alerts = state.setdefault("alerts", {})
+    sent_times = state.setdefault("sent_times", [])
+
+    current = now_ts()
+
+    # Keep only the last hour
+    sent_times[:] = [
+        t for t in sent_times
+        if current - int(t) < 3600
+    ]
+
+    if len(sent_times) >= MAX_ALERTS_PER_HOUR:
+        return False
+
+    previous = alerts.get(key, {})
+    old_stage = int(previous.get("stage", 0))
+    old_score = int(previous.get("score", 0))
+    old_time = int(previous.get("time", 0))
+
+    cooldown = COOLDOWN_MINUTES * 60
+
+    if current - old_time < cooldown:
+        # During cooldown, only allow a meaningful upgrade
+        if result["stage"] <= old_stage:
+            return False
+
+    if result["stage"] < old_stage:
+        return False
+
+    # Same stage: only notify on a meaningful score increase
+    if result["stage"] == old_stage:
+        if result["score"] < old_score + 10:
+            return False
+
+    return True
+
+
+def process_alert(result, state):
+    if not should_send_alert(result, state):
+        return False
+
+    direction_text = (
+        "احتمال حرکت صعودی"
+        if result["direction"] == "PUMP"
+        else "احتمال حرکت نزولی"
+    )
+
+    reasons = result.get("reasons", [])
+    reason_text = "\n".join(
+        "• " + reason for reason in reasons
+    ) or "نشانه‌های اولیه بازار"
+
+    message = (
+        f"{stage_name(result['stage'])}\n"
+        f"EARLY {result['direction']} — {VERSION}\n\n"
+        f"ارز: {result['base']}\n"
+        f"صرافی: {result['exchange']}\n"
+        f"قیمت: {result['price']}\n"
+        f"امتیاز: {result['score']}/100\n"
+        f"جهت احتمالی: {direction_text}\n\n"
+        f"شتاب ۵ دقیقه‌ای: {result['momentum']:.2f}%\n"
+        f"نسبت حجم: {result['volume_ratio']:.2f}x\n"
+        f"Funding: "
+        f"{result['funding'] if result['funding'] is not None else 'ناموجود'}\n"
+        f"تغییر OI: "
+        f"{result['oi_change'] if result['oi_change'] is not None else 'ناموجود'}\n\n"
+        f"دلایل:\n{reason_text}\n\n"
+        "⚠️ این هشدار پیشنهاد قطعی خرید یا فروش نیست."
+    )
+
+    if not telegram_send(message):
+        return False
+
+    key = result["base"] + "_" + result["direction"]
+
+    state["alerts"][key] = {
+        "stage": result["stage"],
+        "score": result["score"],
+        "time": now_ts()
+    }
+
+    state["sent_times"].append(now_ts())
+
+    return True
+
+# ==========================================
+# SCAN SUMMARY
+# ==========================================
+
+def send_scan_summary(stats, scanned, alerts_sent, errors):
+    message = (
+        f"📊 گزارش اسکن {VERSION}\n"
+        f"زمان: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        f"🔎 نامزدهای انتخاب‌شده: {stats['candidates']}\n"
+        f"✅ تحلیل موفق: {scanned}\n"
+        f"⚠️ خطاها: {errors}\n"
+        f"📨 هشدارهای ارسال‌شده: {alerts_sent}\n\n"
+        f"Bitunix: {stats['Bitunix']}\n"
+        f"Toobit: {stats['Toobit']}\n\n"
+        "سطوح هشدار:\n"
+        "🟡 40 تا 54: آماده‌باش\n"
+        "🟠 55 تا 69: هشدار قوی\n"
+        "🔴 70 تا 100: سیگنال نهایی\n\n"
+        "ربات فقط تحلیل و هشدار می‌دهد؛ معامله خودکار ندارد."
+    )
+
+    telegram_send(message)
+
+
+# ==========================================
+# MAIN SCANNER
+# ==========================================
 
 def main():
-    print("EARLY PUMP & DUMP SCANNER V4")
-    print("One-shot scan started.")
+    print("=" * 45)
+    print("EARLY PUMP & DUMP SCANNER", VERSION)
+    print("No automatic trading")
+    print("=" * 45)
 
-    if not TOKEN or not CHAT_ID:
-        print("WARNING: Telegram credentials are missing from environment.")
+    state = load_state()
+
+    stats = {
+        "candidates": 0,
+        "Bitunix": 0,
+        "Toobit": 0
+    }
+
+    scanned = 0
+    alerts_sent = 0
+    errors = 0
 
     try:
-        scan_bitunix()
-    except Exception as error:
-        stats["Bitunix"]["errors"] += 1
-        print("Bitunix scan failed:", str(error)[:250])
+        candidates = get_candidates()
 
-    try:
-        scan_toobit()
-    except Exception as error:
-        stats["Toobit"]["errors"] += 1
-        print("Toobit scan failed:", str(error)[:250])
+        stats["candidates"] = len(candidates)
 
-    print_report()
+        bitunix_funding = bitunix_funding_all()
+
+        for index, market in enumerate(candidates, start=1):
+            exchange = market["exchange"]
+            stats[exchange] += 1
+
+            print(
+                f"[{index}/{len(candidates)}] "
+                f"{exchange} {market['symbol']}"
+            )
+
+            try:
+                result = analyze_market(
+                    market,
+                    state,
+                    bitunix_funding
+                )
+
+                if result is None:
+                    print("Not enough valid market data")
+                    continue
+
+                scanned += 1
+
+                print(
+                    "Score:",
+                    result["score"],
+                    "Direction:",
+                    result["direction"],
+                    "Stage:",
+                    result["stage"]
+                )
+
+                if process_alert(result, state):
+                    alerts_sent += 1
+                    print("Telegram alert sent")
+
+            except Exception as exc:
+                errors += 1
+                print(
+                    "Market analysis error:",
+                    market.get("symbol"),
+                    str(exc)[:180]
+                )
+
+    except Exception as exc:
+        errors += 1
+        print("Main scan error:", str(exc)[:250])
+
+    finally:
+        save_state(state)
+
+        send_scan_summary(
+            stats,
+            scanned,
+            alerts_sent,
+            errors
+        )
+
+        save_state(state)
+
+    print("=" * 45)
+    print("Scan completed")
+    print("Analyzed:", scanned)
+    print("Alerts:", alerts_sent)
+    print("Errors:", errors)
+    print("=" * 45)
 
 
 if __name__ == "__main__":
