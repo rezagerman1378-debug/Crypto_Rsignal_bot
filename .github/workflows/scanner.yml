@@ -1,5 +1,5 @@
 
-name: Run scanner V3
+name: Run scanner V5
 
 on:
   workflow_dispatch:
@@ -7,31 +7,46 @@ on:
     - cron: "*/5 * * * *"
 
 concurrency:
-  group: crypto-scanner-v3
+  group: crypto-scanner-v5
   cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Restore scanner state
+        uses: actions/cache/restore@v4
+        with:
+          path: scanner_state.json
+          key: scanner-state-v5-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            scanner-state-v5-
+
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install requirements
         run: pip install -r requirements.txt
 
-      - name: Run scanner V3
+      - name: Run scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MIN_SCORE: "75"
+          TOP_CANDIDATES: "100"
           MAX_ALERTS_PER_HOUR: "5"
-          TOP_CANDIDATES: "30"
+          COOLDOWN_MINUTES: "90"
         run: python scanner.py
+
+      - name: Save scanner state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: scanner_state.json
+          key: scanner-state-v5-${{ github.run_id }}-${{ github.run_attempt }}
